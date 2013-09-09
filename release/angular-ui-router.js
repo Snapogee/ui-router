@@ -1,6 +1,6 @@
 /**
  * State-based routing for AngularJS
- * @version v0.2.0
+ * @version v0.2.0-dev-2013-09-09
  * @link http://angular-ui.github.com/
  * @license MIT License, http://www.opensource.org/licenses/MIT
  */
@@ -214,7 +214,7 @@ function $Resolve(  $q,    $injector) {
         }
         // Wait for any parameter that we have a promise for (either from parent or from this
         // resolve; in that case study() will have made sure it's ordered before us in the plan).
-        params.forEach(function (dep) {
+        forEach(params, function (dep) {
           if (promises.hasOwnProperty(dep) && !locals.hasOwnProperty(dep)) {
             waitParams++;
             promises[dep].then(function (result) {
@@ -976,7 +976,7 @@ function $StateProvider(   $urlRouterProvider,   $urlMatcherFactory,           $
     $state.transitionTo = function transitionTo(to, toParams, options) {
       if (!isDefined(options)) options = (options === true || options === false) ? { location: options } : {};
       toParams = toParams || {};
-      options = extend({ location: true, inherit: false, relative: null }, options);
+      options = extend({ location: true, inherit: false, relative: null, replace: false }, options);
 
       var toState = findState(to, options.relative);
       if (!isDefined(toState)) throw new Error("No such state " + toState);
@@ -1062,6 +1062,10 @@ function $StateProvider(   $urlRouterProvider,   $urlMatcherFactory,           $
         var toNav = to.navigable;
         if (options.location && toNav) {
           $location.url(toNav.url.format(toNav.locals.globals.$stateParams));
+          
+          if (options.replace === true) {
+            $location.replace();
+          }
         }
 
         $rootScope.$broadcast('$stateChangeSuccess', to.self, toParams, from.self, fromParams);
@@ -1370,7 +1374,7 @@ function $StateRefDirective($state) {
 
       if (ref.paramExpr) {
         scope.$watch(ref.paramExpr, function(newVal, oldVal) {
-          if (newVal !== oldVal) update(newVal);
+          if (newVal !== params) update(newVal);
         }, true);
         params = scope.$eval(ref.paramExpr);
       }
