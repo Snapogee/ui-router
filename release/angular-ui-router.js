@@ -1,9 +1,15 @@
 /**
  * State-based routing for AngularJS
- * @version v0.2.0-dev-2013-09-09
+ * @version v0.2.2-dev-2013-10-08
  * @link http://angular-ui.github.com/
  * @license MIT License, http://www.opensource.org/licenses/MIT
  */
+
+/* commonjs package manager support (eg componentjs) */
+if (typeof module !== "undefined" && typeof exports !== "undefined" && module.exports === exports){
+  module.exports = 'ui.router';
+}
+
 (function (window, angular, undefined) {
 /*jshint globalstrict:true*/
 /*global angular:false*/
@@ -127,7 +133,7 @@ function $Resolve(  $q,    $injector) {
       visited[key] = VISIT_IN_PROGRESS;
       
       if (isString(value)) {
-        plan.push(key, [ function() { return $injector.get(key); }], NO_DEPENDENCIES);
+        plan.push(key, [ function() { return $injector.get(value); }], NO_DEPENDENCIES);
       } else {
         var params = $injector.annotate(value);
         forEach(params, function (param) {
@@ -784,7 +790,7 @@ function $StateProvider(   $urlRouterProvider,   $urlMatcherFactory,           $
     // inherit 'data' from parent and override by own values (if any)
     data: function(state) {
       if (state.parent && state.parent.data) {
-        state.data = state.self.data = angular.extend({}, state.parent.data, state.data);
+        state.data = state.self.data = extend({}, state.parent.data, state.data);
       }
       return state.data;
     },
@@ -866,14 +872,19 @@ function $StateProvider(   $urlRouterProvider,   $urlMatcherFactory,           $
       var includes = state.parent ? extend({}, state.parent.includes) : {};
       includes[state.name] = true;
       return includes;
-    }
+    },
+
+    $delegates: {}
   };
 
+  function isRelative(stateName) {
+    return stateName.indexOf(".") === 0 || stateName.indexOf("^") === 0;
+  }
 
   function findState(stateOrName, base) {
     var isStr = isString(stateOrName),
         name  = isStr ? stateOrName : stateOrName.name,
-        path  = name.indexOf(".") === 0 || name.indexOf("^") === 0;
+        path  = isRelative(name);
 
     if (path) {
       if (!base) throw new Error("No reference point given for path '"  + name + "'");
@@ -916,7 +927,7 @@ function $StateProvider(   $urlRouterProvider,   $urlMatcherFactory,           $
     if (states[name]) throw new Error("State '" + name + "'' is already defined");
 
     for (var key in stateBuilder) {
-      state[key] = stateBuilder[key](state);
+      if (isFunction(stateBuilder[key])) state[key] = stateBuilder[key](state, stateBuilder.$delegates[key]);
     }
     states[name] = state;
 
@@ -928,6 +939,7 @@ function $StateProvider(   $urlRouterProvider,   $urlMatcherFactory,           $
         }
       }]);
     }
+
     return state;
   }
 
@@ -941,6 +953,25 @@ function $StateProvider(   $urlRouterProvider,   $urlMatcherFactory,           $
   });
   root.navigable = null;
 
+
+  // .decorator()
+  // .decorator(name)
+  // .decorator(name, function)
+  this.decorator = decorator;
+  function decorator(name, func) {
+    /*jshint validthis: true */
+    if (isString(name) && !isDefined(func)) {
+      return stateBuilder[name];
+    }
+    if (!isFunction(func) || !isString(name)) {
+      return this;
+    }
+    if (stateBuilder[name] && !stateBuilder.$delegates[name]) {
+      stateBuilder.$delegates[name] = stateBuilder[name];
+    }
+    stateBuilder[name] = func;
+    return this;
+  }
 
   // .state(state)
   // .state(name, state)
@@ -960,6 +991,8 @@ function $StateProvider(   $urlRouterProvider,   $urlMatcherFactory,           $
 
     var TransitionSuperseded = $q.reject(new Error('transition superseded'));
     var TransitionPrevented = $q.reject(new Error('transition prevented'));
+    var TransitionAborted = $q.reject(new Error('transition aborted'));
+    var TransitionFailed = $q.reject(new Error('transition failed'));
 
     root.locals = { resolve: null, globals: { $stateParams: {} } };
     $state = {
@@ -976,16 +1009,51 @@ function $StateProvider(   $urlRouterProvider,   $urlMatcherFactory,           $
     $state.transitionTo = function transitionTo(to, toParams, options) {
       if (!isDefined(options)) options = (options === true || options === false) ? { location: options } : {};
       toParams = toParams || {};
-      options = extend({ location: true, inherit: false, relative: null, replace: false }, options);
+      options = extend({ location: true, inherit: false, relative: null, $retry: false, replace: false }, options);
+
+      var from = $state.$current, fromParams = $state.params, fromPath = from.path;
 
       var toState = findState(to, options.relative);
-      if (!isDefined(toState)) throw new Error("No such state " + toState);
+
+      var evt;
+
+      if (!isDefined(toState)) {
+        // Broadcast not found event and abort the transition if prevented
+        var redirect = { to: to, toParams: toParams, options: options };
+        evt = $rootScope.$broadcast('$stateNotFound', redirect, from.self, fromParams);
+        if (evt.defaultPrevented) return TransitionAborted;
+
+        // Allow the handler to return a promise to defer state lookup retry
+        if (evt.retry) {
+          if (options.$retry) return TransitionFailed;
+          var retryTransition = $state.transition = $q.when(evt.retry);
+          retryTransition.then(function() {
+            if (retryTransition !== $state.transition) return TransitionSuperseded;
+            redirect.options.$retry = true;
+            return $state.transitionTo(redirect.to, redirect.toParams, redirect.options);
+          },
+          function() {
+            return TransitionAborted;
+          });
+          return retryTransition;
+        }
+
+        // Always retry once if the $stateNotFound was not prevented
+        // (handles either redirect changed or state lazy-definition)
+        to = redirect.to;
+        toParams = redirect.toParams;
+        options = redirect.options;
+        toState = findState(to, options.relative);
+        if (!isDefined(toState)) {
+          if (options.relative) throw new Error("Could not resolve '" + to + "' from state '" + options.relative + "'");
+          throw new Error("No such state '" + to + "'");
+        }
+      }
       if (toState['abstract']) throw new Error("Cannot transition to abstract state '" + to + "'");
       if (options.inherit) toParams = inheritParams($stateParams, toParams || {}, $state.$current, toState);
       to = toState;
 
-      var toPath = to.path,
-          from = $state.$current, fromParams = $state.params, fromPath = from.path;
+      var toPath = to.path;
 
       // Starting from the root of the path, keep all levels that haven't changed
       var keep, state, locals = root.locals, toLocals = [];
@@ -1008,7 +1076,7 @@ function $StateProvider(   $urlRouterProvider,   $urlMatcherFactory,           $
       toParams = normalize(to.params, toParams || {});
 
       // Broadcast start event and cancel the transition if requested
-      var evt = $rootScope.$broadcast('$stateChangeStart', to.self, toParams, from.self, fromParams);
+      evt = $rootScope.$broadcast('$stateChangeStart', to.self, toParams, from.self, fromParams);
       if (evt.defaultPrevented) return TransitionPrevented;
 
       // Resolve locals for the remaining states, but don't update any global state just
@@ -1024,7 +1092,7 @@ function $StateProvider(   $urlRouterProvider,   $urlMatcherFactory,           $
         resolved = resolveState(state, toParams, state===to, resolved, locals);
       }
 
-      // Once everything is resolved, wer are ready to perform the actual transition
+      // Once everything is resolved, we are ready to perform the actual transition
       // and return a promise for the new state. We also keep track of what the
       // current promise is, so that we can detect overlapping transitions and
       // keep only the outcome of the last transition.
@@ -1083,28 +1151,66 @@ function $StateProvider(   $urlRouterProvider,   $urlMatcherFactory,           $
       return transition;
     };
 
-    $state.is = function is(stateOrName) {
+    $state.is = function is(stateOrName, params) {
       var state = findState(stateOrName);
-      return (isDefined(state)) ? $state.$current === state : undefined;
+
+      if (!isDefined(state)) {
+        return undefined;
+      }
+
+      if ($state.$current !== state) {
+        return false;
+      }
+
+      return isDefined(params) ? angular.equals($stateParams, params) : true;
     };
 
-    $state.includes = function includes(stateOrName) {
+    $state.includes = function includes(stateOrName, params) {
       var state = findState(stateOrName);
-      return (isDefined(state)) ? isDefined($state.$current.includes[state.name]) : undefined;
+      if (!isDefined(state)) {
+        return undefined;
+      }
+
+      if (!isDefined($state.$current.includes[state.name])) {
+        return false;
+      }
+
+      var validParams = true;
+      angular.forEach(params, function(value, key) {
+        if (!isDefined($stateParams[key]) || $stateParams[key] !== value) {
+          validParams = false;
+        }
+      });
+      return validParams;
     };
 
     $state.href = function href(stateOrName, params, options) {
-      options = extend({ lossy: true, inherit: false, relative: $state.$current }, options || {});
+      options = extend({ lossy: true, inherit: false, absolute: false, relative: $state.$current }, options || {});
       var state = findState(stateOrName, options.relative);
       if (!isDefined(state)) return null;
 
       params = inheritParams($stateParams, params || {}, $state.$current, state);
       var nav = (state && options.lossy) ? state.navigable : state;
       var url = (nav && nav.url) ? nav.url.format(normalize(state.params, params || {})) : null;
-      return !$locationProvider.html5Mode() && url ? "#" + url : url;
+      if (!$locationProvider.html5Mode() && url) {
+        url = "#" + url;
+      }
+      if (options.absolute && url) {
+        url = $location.protocol() + '://' + 
+              $location.host() + 
+              ($location.port() == 80 || $location.port() == 443 ? '' : ':' + $location.port()) + 
+              (!$locationProvider.html5Mode() && url ? '/' : '') + 
+              url;
+      }
+      return url;
     };
 
     $state.get = function (stateOrName) {
+      if (!isDefined(stateOrName)) {
+        var list = [];
+        forEach(states, function(state) { list.push(state.self); });
+        return list;
+      }
       var state = findState(stateOrName);
       return (state && state.self) ? state.self : null;
     };
@@ -1230,13 +1336,15 @@ function $ViewDirective(   $state,   $compile,   $controller,   $injector,   $an
   var directive = {
     restrict: 'ECA',
     terminal: true,
+    priority: 1000,
     transclude: true,
     compile: function (element, attr, transclude) {
       return function(scope, element, attr) {
         var viewScope, viewLocals,
             name = attr[directive.name] || attr.name || '',
             onloadExp = attr.onload || '',
-            animate = isDefined($animator) && $animator(scope, attr);
+            animate = isDefined($animator) && $animator(scope, attr),
+            initialView = transclude(scope);
 
         // Returns a set of DOM manipulation functions based on whether animation
         // should be performed
@@ -1263,7 +1371,7 @@ function $ViewDirective(   $state,   $compile,   $controller,   $injector,   $an
         };
 
         // Put back the compiled initial view
-        element.append(transclude(scope));
+        element.append(initialView);
 
         // Find the details of the parent view directive (if any) and use it
         // to derive our own qualified view name, then hang our own details
@@ -1307,7 +1415,7 @@ function $ViewDirective(   $state,   $compile,   $controller,   $injector,   $an
             view.state = null;
 
             // Restore the initial view
-            return render.restore(transclude(scope), element);
+            return render.restore(initialView, element);
           }
 
           viewLocals = locals;
@@ -1383,7 +1491,9 @@ function $StateRefDirective($state) {
       if (isForm) return;
 
       element.bind("click", function(e) {
-        if ((e.which == 1) && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
+        var button = e.which || e.button;
+
+        if ((button == 1) && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
           $state.go(ref.state, params, { relative: base });
           scope.$apply();
           e.preventDefault();
