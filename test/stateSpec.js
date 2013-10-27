@@ -1,6 +1,6 @@
 describe('state', function () {
 
-  var stateProvider, locationProvider, templateParams;
+  var stateProvider, locationProvider, templateParams, ctrlName;
 
   beforeEach(module('ui.router', function($locationProvider) {
     locationProvider = $locationProvider;
@@ -25,7 +25,7 @@ describe('state', function () {
       E = { params: [ 'i' ] },
       H = { data: {propA: 'propA', propB: 'propB'} },
       HH = { parent: H },
-      HHH = {parent: HH, data: {propA: 'overriddenA', propC: 'propC'} }
+      HHH = {parent: HH, data: {propA: 'overriddenA', propC: 'propC'} },
       AppInjectable = {};
 
   beforeEach(module(function ($stateProvider, $provide) {
@@ -59,6 +59,28 @@ describe('state', function () {
           return "/templates/" + params.item + ".html";
         }
       })
+      .state('dynamicController', {
+        url: "/dynamic/:type",
+        template: "test",
+        controllerProvider: function($stateParams) {
+          ctrlName = $stateParams.type + "Controller";
+          return ctrlName;
+        }
+      })
+      .state('home.redirect', {
+        url: "redir",
+        onEnter: function($state) {
+          $state.transitionTo("about");
+        }
+      })
+      .state('resolveFail', {
+        url: "/resolve-fail",
+        resolve: {
+          badness: function($q) {
+            return $q.reject("!");
+          }
+        }
+      })
 
       .state('first', { url: '^/first/subpath' })
       .state('second', { url: '^/second' });
@@ -87,6 +109,16 @@ describe('state', function () {
     expect($state.current).toBe(state);
   }
 
+  describe('provider', function () {
+    it ('should ignore Object properties when registering states', function () {
+      expect(function() {
+        stateProvider.state('toString', { url: "/to-string" });
+      }).not.toThrow();
+      expect(function() {
+        stateProvider.state('watch', { url: "/watch" });
+      }).not.toThrow();
+    });
+  });
 
   describe('.transitionTo()', function () {
     it('returns a promise for the target state', inject(function ($state, $q) {
@@ -262,6 +294,36 @@ describe('state', function () {
       expect($state.current).toBe(D);
     }));
 
+    it('does not trigger $stateChangeSuccess when suppressed, but changes state', inject(function ($state, $q, $rootScope) {
+      initStateTo(E, { i: 'iii' });
+      var called;
+
+      $rootScope.$on('$stateChangeSuccess', function (ev, to, toParams, from, fromParams) {
+        called = true;
+      });
+
+      $state.transitionTo(D, { x: '1', y: '2' }, { notify: false });
+      $q.flush();
+
+      expect(called).toBeFalsy();
+      expect($state.current).toBe(D);
+    }));
+
+    it('does not trigger $stateChangeSuccess when suppressed, but updates params', inject(function ($state, $q, $rootScope) {
+      initStateTo(E, { x: 'iii' });
+      var called;
+
+      $rootScope.$on('$stateChangeSuccess', function (ev, to, toParams, from, fromParams) {
+        called = true;
+      });
+      $state.transitionTo(E, { i: '1', y: '2' }, { notify: false });
+      $q.flush();
+
+      expect(called).toBeFalsy();
+      expect($state.params.i).toBe('1');
+      expect($state.current).toBe(E);
+    }));
+
     it('is a no-op when passing the current state and identical parameters', inject(function ($state, $q) {
       initStateTo(A);
       var trans = $state.transitionTo(A, {}); // no-op
@@ -296,8 +358,13 @@ describe('state', function () {
       $q.flush();
       expect($state.current).toBe(A);
       expect(resolvedError(superseded)).toBeTruthy();
-      expect(log).toBe(
-        '$stateChangeStart(B,A);');
+      expect(log).toBe('$stateChangeStart(B,A);');
+    }));
+
+    it('aborts pending transitions when aborted from callbacks', inject(function ($state, $q) {
+      var superseded = $state.transitionTo('home.redirect');
+      $q.flush();
+      expect($state.current.name).toBe('about');
     }));
 
     it('triggers onEnter and onExit callbacks', inject(function ($state, $q) {
@@ -330,6 +397,12 @@ describe('state', function () {
 
       var err = "Could not resolve '^.Z' from state 'DD'";
       expect(function() { $state.transitionTo("^.Z", null, { relative: $state.$current }); }).toThrow(err);
+    }));
+
+    it('uses the controllerProvider to get controller dynamically', inject(function ($state, $q) {
+      $state.transitionTo('dynamicController', { type: "Acme" });
+      $q.flush();
+      expect(ctrlName).toEqual("AcmeController");
     }));
   });
 
@@ -544,9 +617,12 @@ describe('state', function () {
         'about.person.item',
         'about.sidebar',
         'about.sidebar.item',
+        'dynamicController',
         'first',
         'home',
         'home.item',
+        'home.redirect',
+        'resolveFail',
         'second'
       ];
       expect(list.map(function(state) { return state.name; })).toEqual(names);
@@ -585,6 +661,49 @@ describe('state', function () {
       $rootScope.$broadcast("$locationChangeSuccess");
       $rootScope.$apply();
       expect($state.current.name).toBe('');
+    }));
+
+    it('should revert to last known working url on state change failure', inject(function ($state, $rootScope, $location, $q) {
+      $state.transitionTo("about");
+      $q.flush();
+
+      $location.path("/resolve-fail");
+      $rootScope.$broadcast("$locationChangeSuccess");
+      $rootScope.$apply();
+
+      expect($state.current.name).toBe("about");
+    }));
+
+    it('should replace browser history when "replace" enabled', inject(function ($state, $rootScope, $location, $q) {
+      var originalReplaceFn = $location.replace, replaceWasCalled = false;
+
+      // @todo Replace this with a spy
+      var decoratedReplaceFn = function() {
+        replaceWasCalled = true;
+        originalReplaceFn.call($location);
+      };
+      $location.replace = decoratedReplaceFn;
+
+      $state.transitionTo('about', {}, { location: 'replace' });
+      $q.flush();
+
+      expect(replaceWasCalled).toEqual(true);
+    }));
+
+    it('should not replace history normally', inject(function ($state, $rootScope, $location, $q) {
+      var originalReplaceFn = $location.replace, replaceWasCalled = false;
+
+      // @todo Replace with spy
+      var decoratedReplaceFn = function() {
+        replaceWasCalled = true;
+        originalReplaceFn.call($location);
+      };
+      $location.replace = decoratedReplaceFn;
+
+      $state.transitionTo('about');
+      $q.flush();
+
+      expect(replaceWasCalled).toEqual(false);
     }));
   });
 
@@ -714,5 +833,40 @@ describe('state', function () {
       expect($state.$current.views['viewB@'].templateProvider()).toBe('Template for viewB@');
     }));
 
+  });
+});
+
+describe('state queue', function(){
+  angular.module('ui.router.queue.test', ['ui.router.queue.test.dependency'])
+    .config(function($stateProvider) {
+      $stateProvider
+        .state('queue-test-a', {})
+        .state('queue-test-b-child', { parent: 'queue-test-b' })
+        .state('queue-test-b', {});
+    });
+  angular.module('ui.router.queue.test.dependency', [])
+    .config(function($stateProvider) {
+      $stateProvider
+        .state('queue-test-a.child', {})
+    });
+
+  var expectedStates = ['','queue-test-a', 'queue-test-a.child', 'queue-test-b', 'queue-test-b-child'];
+
+  it('should work across modules', function() {
+    module('ui.router.queue.test', 'ui.router.queue.test.dependency');
+
+    inject(function ($state) {
+      var list = $state.get().sort(function(a, b) { return (a.name > b.name) - (b.name > a.name); });
+      expect(list.map(function(state) { return state.name; })).toEqual(expectedStates);
+    });
+  });
+
+  it('should work when parent is name string', function() {
+    module('ui.router.queue.test', 'ui.router.queue.test.dependency');
+
+    inject(function ($state) {
+      var list = $state.get().sort(function(a, b) { return (a.name > b.name) - (b.name > a.name); });
+      expect(list.map(function(state) { return state.name; })).toEqual(expectedStates);
+    });
   });
 });
